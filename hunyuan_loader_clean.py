@@ -10,13 +10,14 @@ Copyright (c) 2025 Eric Hiss. All rights reserved.
 
 import gc
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
 import torch
 from torch import nn
-from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import AutoConfig, AutoModelForCausalLM, BitsAndBytesConfig
 
 logger = logging.getLogger(__name__)
 
@@ -229,7 +230,7 @@ class CleanModelLoader:
         
         Args:
             model_path: Path to model directory
-            quant_type: One of "bf16", "nf4", "int8", "gguf"
+            quant_type: One of "bf16", "nf4", "int8", "fp8", "gguf"
             device: Target device (e.g., "cuda:0")
             dtype: Compute dtype for non-quantized layers
             reserve_vram_gb: VRAM to reserve for inference (BF16 only)
@@ -256,10 +257,12 @@ class CleanModelLoader:
                 result = cls._load_int8_block_swap(model_path, device, dtype)
             else:
                 result = cls._load_int8(model_path, device, dtype)
+        elif quant_type == "fp8":
+            result = cls._load_fp8(model_path, device, dtype)
         elif quant_type == "gguf":
             result = cls._load_gguf(model_path, device, dtype)
         else:
-            raise ValueError(f"Unknown quant_type: {quant_type}. Expected bf16, nf4, int8, or gguf")
+            raise ValueError(f"Unknown quant_type: {quant_type}. Expected bf16, nf4, int8, fp8, or gguf")
         
         elapsed = time.time() - start_time
         result.load_time_seconds = elapsed
@@ -919,6 +922,155 @@ class CleanModelLoader:
             dtype=dtype,
             load_time_seconds=0.0,
             uses_device_map=True
+        )
+    
+    @classmethod
+    def _load_fp8(
+        cls,
+        model_path: str,
+        device: str,
+        dtype: torch.dtype
+    ) -> LoadResult:
+        """
+        Load FP8 quantized model for flashinfer fused MoE.
+        
+        FP8 models have expert weights in float8_e4m3fn with per-tensor scales.
+        Non-expert weights remain in bf16. The model uses flashinfer's
+        trtllm_fp8_per_tensor_scale_moe kernel for inference.
+        
+        Custom loading is required because transformers' from_pretrained
+        upcasts FP8 tensors to the module dtype (bf16), which doubles memory.
+        This loader preserves FP8 dtype for expert weights and attaches
+        per-tensor scales to expert modules.
+        """
+        from safetensors import safe_open
+        from accelerate.utils import set_module_tensor_to_device
+        import json as _json
+        
+        logger.info(f"Loading FP8 model from {model_path}")
+        logger.info("FP8 model uses flashinfer trtllm_fp8_per_tensor_scale_moe kernel")
+        
+        # Load config and set moe_impl to flashinfer_fp8
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        config.moe_impl = "flashinfer_fp8"
+        config.moe_drop_tokens = True
+        config.attn_implementation = "sdpa"
+        
+        # Create model on meta device (zero memory)
+        logger.info("Creating model on meta device...")
+        with torch.device("meta"):
+            model = AutoModelForCausalLM.from_config(
+                config,
+                trust_remote_code=True,
+                dtype=torch.bfloat16,
+            )
+        
+        # Load safetensors index to know which keys are in which shards
+        index_path = os.path.join(model_path, "model.safetensors.index.json")
+        with open(index_path) as f:
+            index = _json.load(f)
+        weight_map = index["weight_map"]
+        
+        # Group keys by shard file
+        from collections import defaultdict
+        shard_keys = defaultdict(list)
+        for key, shard_file in weight_map.items():
+            shard_keys[shard_file].append(key)
+        
+        # Load weights shard by shard
+        total_shards = len(shard_keys)
+        scale_count = 0
+        fp8_count = 0
+        bf16_count = 0
+        
+        for shard_idx, (shard_file, keys) in enumerate(sorted(shard_keys.items()), 1):
+            shard_path = os.path.join(model_path, shard_file)
+            logger.info(f"Loading shard {shard_idx}/{total_shards}: {shard_file} ({len(keys)} tensors)")
+            
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                for key in keys:
+                    tensor = f.get_tensor(key)
+
+                    if key.endswith(".weight_scale"):
+                        # Attach scale to the parent module (e.g., gate_and_up_proj)
+                        parts = key.split(".")
+                        # key: model.layers.X.mlp.experts.Y.gate_and_up_proj.weight_scale
+                        # parent module path: model.layers.X.mlp.experts.Y.gate_and_up_proj
+                        module = model
+                        for part in parts[:-1]:  # exclude "weight_scale"
+                            if part.isdigit():
+                                module = module[int(part)]
+                            else:
+                                module = getattr(module, part)
+                        setattr(module, "weight_scale", tensor)
+                        scale_count += 1
+                    else:
+                        # Load tensor preserving its dtype AND its current device.
+                        # When a fast loader (InstantTensor / FastSafetensors) has
+                        # pre-loaded tensors to CUDA, forcing "cpu" here would copy
+                        # the entire 85GB model into CPU RAM -- catastrophic on UMA
+                        # devices like DGX Spark where CPU+GPU share physical RAM.
+                        set_module_tensor_to_device(
+                            model, key, str(tensor.device),
+                            value=tensor, dtype=tensor.dtype,
+                        )
+                        if tensor.dtype == torch.float8_e4m3fn:
+                            fp8_count += 1
+                        else:
+                            bf16_count += 1
+        
+        logger.info(f"Loaded {fp8_count} FP8 tensors, {bf16_count} bf16 tensors, {scale_count} scales")
+        
+        # Store model_path for later reference
+        model._model_path = model_path
+
+        # Load generation_config from disk. We used from_config above (not
+        # from_pretrained), so the model has a default empty GenerationConfig
+        # missing custom fields like use_system_prompt, bot_task, sequence_template,
+        # diff_infer_steps, diff_guidance_scale, flow_shift, etc.
+        try:
+            from transformers import GenerationConfig
+            gen_path = os.path.join(model_path, "generation_config.json")
+            if os.path.isfile(gen_path):
+                model.generation_config = GenerationConfig.from_pretrained(model_path)
+                logger.info("Loaded generation_config.json")
+            else:
+                logger.warning(f"No generation_config.json at {model_path}")
+        except Exception as e:
+            logger.warning(f"Failed to load generation_config: {e}")
+
+        # Load tokenizer
+        if hasattr(model, 'load_tokenizer'):
+            model.load_tokenizer(model_path)
+            logger.info("Tokenizer loaded")
+
+        # Move non-expert components to GPU
+        logger.info(f"Moving non-expert components to {device}...")
+        _move_non_block_components_to_gpu(model, target_device=device, verbose=1)
+
+        # Ensure VAE is in compute dtype (bf16). The VAE weights on disk are
+        # float32 in this checkpoint; without this cast vae.encode returns
+        # float32 latents which then mismatch the bf16 patch_embed conv weights.
+        if hasattr(model, "vae") and model.vae is not None:
+            model.vae = model.vae.to(device=device, dtype=dtype)
+            logger.info(f"VAE cast to {dtype}")
+
+        # Switch to eval mode. AutoModelForCausalLM.from_pretrained does this
+        # automatically; from_config does NOT, leaving self.training=True which
+        # crashes the inference forward path (e.g., `seqlen = input_ids.size(1)`
+        # is taken when input_ids is None during image-only generation).
+        model.eval()
+
+        logger.info(f"FP8 model loaded successfully")
+        
+        return LoadResult(
+            model=model,
+            quant_type="fp8",
+            is_moveable=True,
+            device=device,
+            dtype=dtype,
+            load_time_seconds=0.0,
+            uses_device_map=False
         )
     
     @classmethod

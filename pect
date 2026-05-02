@@ -1,0 +1,64 @@
+Help on function trtllm_fp8_per_tensor_scale_moe in module flashinfer.fused_moe.core:
+
+ttrrttllllmm__ffpp88__ppeerr__tteennssoorr__ssccaallee__mmooee(
+    routing_logits: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    output1_scales_scalar: torch.Tensor,
+    output1_scales_gate_scalar: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    output2_scales_scalar: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: Optional[float],
+    use_routing_scales_on_input: bool,
+    routing_method_type: int = 0,
+    do_finalize: bool = True,
+    enable_pdl: Optional[bool] = None,
+    tune_max_num_tokens: int = 8192,
+    activation_type: int = 3,
+    norm_topk_prob: bool = True,
+    routing_replay_out: Optional[torch.Tensor] = None
+) -> Union[List[torch.Tensor], torch.Tensor]
+    FP8 per tensor scale MoE operation.
+
+    Args:
+        routing_logits: [seq_len, num_experts] tensor of routing logits
+        routing_bias: [num_experts] tensor of routing bias
+        hidden_states: [seq_len, hidden_size] tensor of input hidden states
+        gemm1_weights: [num_experts, M, hidden_size] tensor of first layer weights
+            M is 2*intermediate_size for gated activations and
+            intermediate_size for non-gated activations.
+        output1_scales_scalar: [local_num_experts] tensor of first layer output scales
+        output1_scales_gate_scalar: [local_num_experts] tensor of first layer gate scales
+        gemm2_weights: [num_experts, hidden_size, intermediate_size] tensor of second layer weights
+        output2_scales_scalar: [local_num_experts] tensor of second layer output scales
+        num_experts: Total number of experts
+        top_k: Number of experts to route to per token
+        n_group: Number of expert groups
+        topk_group: Number of groups to consider for top-k routing
+        intermediate_size: Size of intermediate layer
+        local_expert_offset: Offset of local experts in global expert space
+        local_num_experts: Number of experts handled by this device
+        routed_scaling_factor: Scaling factor for routing
+        use_routing_scales_on_input: Whether to use routing scales on input
+        routing_method_type: Type of routing method to use (default: 0)
+        do_finalize: Whether to finalize the output (default: True).
+        enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
+        tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
+        activation_type (int): Type of activation function (default: 3 - Swiglu)
+            - 0: Gelu
+            - 3: Swiglu
+            - 4: Geglu
+            - 6: Relu2 (non-gated)
+            - 7: Identity
+
+    Returns:
+        when do_finalize=True, returns the final MoE output.
+        otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.

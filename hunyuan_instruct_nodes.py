@@ -85,6 +85,15 @@ except ImportError:
         BlockSwapConfig = None
         BlockSwapManager = None
 
+# Import clean model loader (for FP8 loading)
+try:
+    from .hunyuan_loader_clean import CleanModelLoader
+except ImportError:
+    try:
+        from hunyuan_loader_clean import CleanModelLoader
+    except ImportError:
+        CleanModelLoader = None
+
 logger = logging.getLogger(__name__)
 
 # =============================================================================
@@ -577,6 +586,8 @@ def detect_model_type(model_path: str) -> Dict[str, Any]:
         quant_type = "nf4"
     elif "int8" in name_lower or "8bit" in name_lower:
         quant_type = "int8"
+    elif "fp8" in name_lower:
+        quant_type = "fp8"
     else:
         quant_type = "bf16"
     
@@ -1777,6 +1788,19 @@ class HunyuanInstructLoader:
                     )
                 model_info["is_moveable"] = False
             
+        elif quant_type == "fp8":
+            # FP8 pre-quantized models: ~85GB. Uses flashinfer trtllm_fp8_per_tensor_scale_moe.
+            # Custom loader preserves FP8 dtype for expert weights.
+            logger.info("Loading pre-quantized FP8 Instruct model...")
+            result = CleanModelLoader.load(
+                model_path=model_path,
+                quant_type="fp8",
+                device="cuda:0",
+                dtype=torch.bfloat16,
+            )
+            model = result.model
+            model_info["is_moveable"] = result.is_moveable
+
         else:
             # BF16 model: ~160GB. Strategy depends on blocks_to_swap.
             
